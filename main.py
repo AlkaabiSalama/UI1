@@ -1,74 +1,81 @@
+# main.py
 import json
 import os
+from typing import Optional
 
 import ee
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
 from pydantic import BaseModel
 
 from config import YEARS, LOCATION_LAT, LOCATION_LON, LOCATION_NAME
-from gee_utils import get_dw_tile_urls   # your existing logic
-from chat_utils import ask_chatbot       # OpenAI helper
+from gee_utils import get_dw_tile_urls   # must exist in this folder
+from chat_utils import ask_chatbot       # must exist in this folder
 
 
-# ---------------------------
-# FastAPI app + CORS
-# ---------------------------
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # you can restrict later
+    allow_origins=["*"],   # can restrict later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# -------- EARTH ENGINE INIT (SAFE) --------
+EE_READY = False
+EE_ERROR = None
 
-# ---------------------------
-# Earth Engine init
-# ---------------------------
+
 def init_ee():
-    """
-    Initialize Earth Engine using a service account JSON stored in
-    environment variable EE_SERVICE_ACCOUNT_JSON.
-    """
-    if getattr(init_ee, "_done", False):
+    """Initialize Earth Engine once. Don't crash the whole app if it fails."""
+    global EE_READY, EE_ERROR
+    if EE_READY:
         return
 
-    service_account_json = os.environ.get("EE_SERVICE_ACCOUNT_JSON")
-    if not service_account_json:
-        raise RuntimeError(
-            "EE_SERVICE_ACCOUNT_JSON env var is missing. "
-            "On Render, set it in the Environment tab."
-        )
+    try:
+        service_account_json = os.environ.get("EE_SERVICE_ACCOUNT_JSON")
+        if not service_account_json:
+            raise RuntimeError(
+                "EE_SERVICE_ACCOUNT_JSON is missing. "
+                "Set it in Render → Environment."
+            )
 
-    info = json.loads(service_account_json)
-    email = info["client_email"]
-    project_id = info.get("project_id")
+        info = json.loads(service_account_json)
+        email = info["client_email"]
+        project_id = info.get("project_id")
 
-    credentials = ee.ServiceAccountCredentials(email, key_data=service_account_json)
-    if project_id:
-        ee.Initialize(credentials, project=project_id)
-    else:
-        ee.Initialize(credentials)
+        credentials = ee.ServiceAccountCredentials(email, key_data=service_account_json)
+        if project_id:
+            ee.Initialize(credentials, project=project_id)
+        else:
+            ee.Initialize(credentials)
 
-    init_ee._done = True
+        EE_READY = True
+        EE_ERROR = None
+        print("✅ Earth Engine initialized successfully.")
+    except Exception as e:
+        EE_READY = False
+        EE_ERROR = str(e)
+        # Log but don't crash
+        print("❌ Failed to initialize Earth Engine:", EE_ERROR)
 
 
-init_ee()
+@app.on_event("startup")
+async def startup_event():
+    # Try to init EE when the app starts
+    init_ee()
 
 
-# ---------------------------
-# Pydantic models
-# ---------------------------
+# -------- MODELS --------
 class MapRequest(BaseModel):
-    mode: str          # "change_detection" | "single_year" | "timeseries"
+    mode: str
     year_a: int
     year_b: int
-    city: str | None = None
+    city: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -76,16 +83,14 @@ class ChatRequest(BaseModel):
     mode: str
     year_a: int
     year_b: int
-    city: str | None = None
+    city: Optional[str] = None
 
 
-# ---------------------------
-# Helpers
-# ---------------------------
+# -------- HELPERS --------
 geolocator = Nominatim(user_agent="dw-change-app")
 
 
-def resolve_city(city: str | None):
+def resolve_city(city: Optional[str]):
     """Return (name, lat, lon). Fallback to defaults from config.py."""
     if not city or not city.strip():
         return LOCATION_NAME, LOCATION_LAT, LOCATION_LON
@@ -97,24 +102,33 @@ def resolve_city(city: str | None):
     except (GeocoderTimedOut, GeocoderUnavailable):
         pass
 
-    # Fallback to default location if geocoding fails
     return LOCATION_NAME, LOCATION_LAT, LOCATION_LON
 
 
-# ---------------------------
-# API endpoints
-# ---------------------------
+# -------- SIMPLE HEALTH CHECK --------
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "ee_ready": EE_READY,
+        "ee_error": EE_ERROR,
+    }
+
+
+# -------- MAP ENDPOINT --------
 @app.post("/map-config")
 def map_config(req: MapRequest):
-    """
-    Returns map center + Dynamic World tile URLs for the selected mode/years/city.
-    Frontend calls this whenever the user changes settings.
-    """
+    if not EE_READY:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Earth Engine is not ready: {EE_ERROR}",
+        )
+
     mode = req.mode
     year_a = req.year_a
     year_b = req.year_b
 
-    # Clamp years to valid values
+    # clamp years
     if year_a not in YEARS:
         year_a = YEARS[0]
     if year_b not in YEARS:
@@ -123,7 +137,6 @@ def map_config(req: MapRequest):
     city_name, lat, lon = resolve_city(req.city)
     location_point = ee.Geometry.Point([lon, lat])
 
-    # Use your existing gee_utils.get_dw_tile_urls logic
     if mode == "single_year":
         tiles = get_dw_tile_urls(location_point, year_a, year_a)
     else:
@@ -136,16 +149,13 @@ def map_config(req: MapRequest):
         "year_a": year_a,
         "year_b": year_b,
         "mode": mode,
-        "tiles": tiles,   # {"a": "...", "b": "...", "change": "..."}
+        "tiles": tiles,
     }
 
 
+# -------- CHAT ENDPOINT --------
 @app.post("/chat")
 def chat(req: ChatRequest):
-    """
-    Chat endpoint: the frontend sends the question + map settings.
-    We ask OpenAI and return the reply + a summary for the bottom bar.
-    """
     city_name, lat, lon = resolve_city(req.city)
 
     system_msg = {
@@ -156,8 +166,7 @@ def chat(req: ChatRequest):
             "The app has three analysis modes: change_detection, single_year, timeseries. "
             f"Current mode: {req.mode}, years: {req.year_a}–{req.year_b}. "
             f"Current region: {city_name} at ({lat:.3f}, {lon:.3f}). "
-            "Explain clearly what the map likely shows and any key patterns "
-            "for the selected area and time range."
+            "Explain clearly what the map likely shows and any key patterns."
         ),
     }
 
@@ -170,5 +179,5 @@ def chat(req: ChatRequest):
 
     return {
         "reply": reply,
-        "summary": reply,   # same text for the bottom summary
+        "summary": reply,
     }
