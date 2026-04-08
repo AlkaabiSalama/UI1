@@ -121,6 +121,19 @@ class VideoRequest(BaseModel):
     radius_m: int = 5000
 
 
+class DownloadImageRequest(BaseModel):
+    year: int
+    city: Optional[str] = None
+    size: int = 1024
+    radius_m: int = 5000
+
+
+class DownloadReportRequest(BaseModel):
+    disaster: str
+    city: Optional[str] = None
+    notes: Optional[str] = None
+
+
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
@@ -210,6 +223,62 @@ def download_month_frame(region: ee.Geometry, y: int, m: int, size: int) -> np.n
     img = Image.open(io.BytesIO(r.content)).convert("RGB")
     img = add_frame_label(img, f"{y}-{m:02d}")
     return np.array(img)
+
+
+def build_dw_snapshot_png(
+    city: Optional[str],
+    year: int,
+    size: int = 1024,
+    radius_m: int = 5000,
+) -> tuple[str, str]:
+    city_name, lat, lon = resolve_city(city)
+    point = ee.Geometry.Point([lon, lat])
+    region = point.buffer(radius_m).bounds()
+
+    img, vis = get_dw_image_for_year(point, year)
+    bbox = ee_region_bbox(region)
+    url = img.visualize(**vis).clip(region).getThumbURL({
+        "region": bbox,
+        "dimensions": size,
+        "format": "png",
+    })
+
+    r = requests.get(url, timeout=120)
+    r.raise_for_status()
+    base = Image.open(io.BytesIO(r.content)).convert("RGB")
+
+    draw = ImageDraw.Draw(base)
+    label = f"Location: {city_name}   Year: {year}"
+    pad = 14
+    box_h = 40
+    draw.rounded_rectangle(
+        [pad, base.height - box_h - pad, base.width - pad, base.height - pad],
+        radius=10,
+        fill=(15, 23, 42, 220),
+        outline=(148, 163, 184, 255),
+        width=1,
+    )
+    draw.text((pad + 12, base.height - box_h + 1), label, fill=(229, 231, 235))
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    tmp_path = tmp.name
+    tmp.close()
+    base.save(tmp_path, format="PNG")
+    return tmp_path, city_name
+
+
+def get_dw_image_for_year(point: ee.Geometry, year: int):
+    start = f"{year}-01-01"
+    end = f"{year}-12-31"
+    img = (
+        ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
+        .filterDate(start, end)
+        .filterBounds(point)
+        .select("label")
+        .mode()
+    )
+    vis = {"min": 0, "max": 8, "palette": CLASS_PALETTE}
+    return img, vis
 
 
 # ---------------------------------------------------------------------
@@ -367,4 +436,51 @@ def timeseries_video(req: VideoRequest):
         tmp_path,
         media_type="video/mp4",
         filename=filename,
+    )
+
+
+@app.post("/download-map-image")
+def download_map_image(req: DownloadImageRequest):
+    if not EE_READY:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Earth Engine is not ready: {EE_ERROR}",
+        )
+
+    year = req.year if req.year in YEARS else YEARS[-1]
+    path, city_name = build_dw_snapshot_png(
+        city=req.city,
+        year=year,
+        size=req.size,
+        radius_m=req.radius_m,
+    )
+    safe_city = city_name.replace(" ", "_").replace("/", "_")
+    return FileResponse(
+        path,
+        media_type="image/png",
+        filename=f"dw_map_{safe_city}_{year}.png",
+    )
+
+
+@app.post("/download-report")
+def download_report(req: DownloadReportRequest):
+    city_name = resolve_city(req.city)[0]
+    notes = req.notes or "Report content placeholder. Integrate backend generation when available."
+    body = (
+        f"Disaster Report\n"
+        f"================\n"
+        f"Disaster: {req.disaster}\n"
+        f"Location: {city_name}\n"
+        f"Date: {date.today().isoformat()}\n\n"
+        f"{notes}\n"
+    )
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8")
+    tmp.write(body)
+    tmp_path = tmp.name
+    tmp.close()
+    safe_disaster = req.disaster.replace(" ", "_").replace("/", "_")
+    return FileResponse(
+        tmp_path,
+        media_type="text/plain",
+        filename=f"report_{safe_disaster}.txt",
     )
