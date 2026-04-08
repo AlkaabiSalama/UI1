@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi import Query
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
 from pydantic import BaseModel
@@ -121,6 +122,19 @@ class VideoRequest(BaseModel):
     radius_m: int = 5000
 
 
+class ImageRequest(BaseModel):
+    year: int
+    city: Optional[str] = None
+    size: int = 1024
+    radius_m: int = 5000
+
+
+class ChangeStatsRequest(BaseModel):
+    year_a: int
+    year_b: int
+    city: Optional[str] = None
+    radius_m: int = 5000
+
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
@@ -212,6 +226,63 @@ def download_month_frame(region: ee.Geometry, y: int, m: int, size: int) -> np.n
     return np.array(img)
 
 
+
+
+CLASS_NAMES = [
+    "Water",
+    "Trees",
+    "Grass",
+    "Flooded Vegetation",
+    "Crops",
+    "Shrub & Scrub",
+    "Built Area",
+    "Bare Ground",
+    "Snow & Ice",
+]
+
+
+def annual_dw_label(region: ee.Geometry, year: int) -> ee.Image:
+    start = f"{year:04d}-01-01"
+    end = f"{year + 1:04d}-01-01"
+    return (
+        ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
+        .filterDate(start, end)
+        .select("label")
+        .mode()
+        .clip(region)
+    )
+
+
+def draw_footer_text(img: Image.Image, text: str) -> Image.Image:
+    draw = ImageDraw.Draw(img)
+    width, height = img.size
+    bar_h = 42
+    draw.rectangle([0, height - bar_h, width, height], fill=(15, 23, 42, 215))
+    draw.text((14, height - 28), text, fill=(229, 231, 235))
+    return img
+
+
+def histogram_for_image(img: ee.Image, region: ee.Geometry):
+    stats = img.reduceRegion(
+        reducer=ee.Reducer.frequencyHistogram(),
+        geometry=region,
+        scale=10,
+        maxPixels=1e8,
+    ).get("label")
+
+    hist = ee.Dictionary(stats).getInfo() or {}
+    out = [0 for _ in range(len(CLASS_NAMES))]
+    for k, v in hist.items():
+        try:
+            idx = int(k)
+            if 0 <= idx < len(out):
+                out[idx] = int(v)
+        except Exception:
+            continue
+    total = sum(out) or 1
+    pct = [round((x / total) * 100, 2) for x in out]
+    return pct
+
 # ---------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------
@@ -260,6 +331,66 @@ def map_config(req: MapRequest):
         "year_b": year_b,
         "mode": mode,
         "tiles": tiles,
+    }
+
+
+@app.post("/map-image")
+def map_image(req: ImageRequest):
+    if not EE_READY:
+        raise HTTPException(status_code=500, detail=f"Earth Engine is not ready: {EE_ERROR}")
+
+    year = req.year if req.year in YEARS else YEARS[-1]
+    city_name, lat, lon = resolve_city(req.city)
+    region = ee.Geometry.Point([lon, lat]).buffer(req.radius_m).bounds()
+
+    palette = ["#" + c for c in CLASS_PALETTE]
+    vis = annual_dw_label(region, year).visualize(min=0, max=8, palette=palette).clip(region)
+    bbox = ee_region_bbox(region)
+    url = vis.getThumbURL({"region": bbox, "dimensions": req.size, "format": "png"})
+
+    r = requests.get(url, timeout=120)
+    r.raise_for_status()
+
+    img = Image.open(io.BytesIO(r.content)).convert("RGB")
+    img = draw_footer_text(img, f"Location: {city_name} | Year: {year}")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    tmp_path = tmp.name
+    tmp.close()
+    img.save(tmp_path, format="PNG")
+
+    return FileResponse(tmp_path, media_type="image/png", filename=f"map_{city_name.replace(' ', '_')}_{year}.png")
+
+
+@app.post("/change-stats")
+def change_stats(req: ChangeStatsRequest):
+    if not EE_READY:
+        raise HTTPException(status_code=500, detail=f"Earth Engine is not ready: {EE_ERROR}")
+
+    year_a = req.year_a if req.year_a in YEARS else YEARS[0]
+    year_b = req.year_b if req.year_b in YEARS else YEARS[-1]
+    city_name, lat, lon = resolve_city(req.city)
+    region = ee.Geometry.Point([lon, lat]).buffer(req.radius_m).bounds()
+
+    before_img = annual_dw_label(region, year_a)
+    after_img = annual_dw_label(region, year_b)
+
+    before_pct = histogram_for_image(before_img, region)
+    after_pct = histogram_for_image(after_img, region)
+    delta = [round(after_pct[i] - before_pct[i], 2) for i in range(len(CLASS_NAMES))]
+
+    biggest = max(range(len(delta)), key=lambda i: abs(delta[i])) if delta else 0
+    trend = "increased" if delta[biggest] >= 0 else "decreased"
+
+    return {
+        "city": city_name,
+        "year_a": year_a,
+        "year_b": year_b,
+        "classes": CLASS_NAMES,
+        "before_pct": before_pct,
+        "after_pct": after_pct,
+        "delta_pct": delta,
+        "summary": f"Largest change: {CLASS_NAMES[biggest]} {trend} by {abs(delta[biggest]):.2f}%.",
     }
 
 
